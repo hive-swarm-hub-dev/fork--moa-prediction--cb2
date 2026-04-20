@@ -177,7 +177,7 @@ def get_proba(mo_clf, X):
 
 # Time-aware ensemble: use as many C values as time allows
 TIME_LIMIT = 285  # leave 15s buffer for submission writing
-C_VALUES = [0.05, 0.1, 0.15, 0.2, 0.3, 0.5]  # try all 6 if time allows
+C_VALUES = [0.03, 0.05, 0.07, 0.10, 0.13]  # 5 low-C models — sparse data needs high regularization
 
 lr_preds = []
 for C in C_VALUES:
@@ -211,11 +211,11 @@ print(f"LogReg ensemble done ({len(lr_preds)} models): {time.time() - t_start:.1
 # Adaptive Bayesian calibration
 # ============================================================
 def adaptive_alpha(br):
-    if   br < 0.001: return 0.80
-    elif br < 0.003: return 0.85
-    elif br < 0.007: return 0.90
-    elif br < 0.015: return 0.93
-    else:            return 0.95
+    if   br < 0.001: return 0.83
+    elif br < 0.003: return 0.88
+    elif br < 0.007: return 0.92
+    elif br < 0.015: return 0.95
+    else:            return 0.97
 
 alphas = np.array([adaptive_alpha(br) for br in base_rates])
 blend  = lr_ens * alphas + base_rates * (1.0 - alphas)
