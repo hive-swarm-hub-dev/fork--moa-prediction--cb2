@@ -121,15 +121,24 @@ X_base_te = scaler.transform(X_base_te)
 print(f"Base features: {X_base_tr.shape}")
 
 # ============================================================
-# Nystroem RBF kernel features — adds non-linearity that LogReg can exploit
+# Nystroem RBF kernel features — two gammas for feature diversity
 # ============================================================
-nys = Nystroem(kernel='rbf', n_components=200, gamma=0.1, random_state=42)
-nys.fit(X_base_tr)
-X_nys_tr = nys.transform(X_base_tr)
-X_nys_te = nys.transform(X_base_te)
+# ============================================================
+# Nystroem on low-dim PCA subspace (30 dims) where kernel is meaningful
+# In 30-dim space: E[||x-y||^2] ≈ 60, so gamma=0.05 gives exp(-3) ≈ 0.05
+# ============================================================
+X_low_tr = np.hstack([gene_tr[:, :35], cell_tr[:, :15]])   # 50-dim subspace
+X_low_te = np.hstack([gene_te[:, :35], cell_te[:, :15]])
+low_scaler = StandardScaler()
+X_low_tr = low_scaler.fit_transform(X_low_tr)
+X_low_te = low_scaler.transform(X_low_te)
 
-# Concatenate base + kernel features
-X_train = np.hstack([X_base_tr, X_nys_tr])
+nys = Nystroem(kernel='rbf', n_components=300, gamma=0.03, random_state=42)
+nys.fit(X_low_tr)
+X_nys_tr = nys.transform(X_low_tr)
+X_nys_te = nys.transform(X_low_te)
+
+X_train = np.hstack([X_base_tr, X_nys_tr])   # 172 + 300 = 472
 X_test  = np.hstack([X_base_te, X_nys_te])
 
 print(f"Full feature matrix: {X_train.shape}")
@@ -155,8 +164,11 @@ def get_proba(mo_clf, X):
             out[:, i] = est.predict_proba(X)[:, pos]
     return out
 
+# ============================================================
+# LogReg ensemble
+# ============================================================
 lr_preds = []
-for C in [0.03, 0.07, 0.15, 0.30]:
+for C in [0.05, 0.1, 0.2]:
     t0 = time.time()
     mo = MultiOutputClassifier(
         LogisticRegression(C=C, solver='lbfgs', max_iter=300),
@@ -167,6 +179,7 @@ for C in [0.03, 0.07, 0.15, 0.30]:
     print(f"  LogReg C={C}: {time.time()-t0:.1f}s")
 
 lr_ens = np.mean(lr_preds, axis=0)
+combined_ens = lr_ens
 print(f"LogReg ensemble done: {time.time() - t_start:.1f}s")
 
 # ============================================================
@@ -182,7 +195,7 @@ def adaptive_alpha(br):
     else:            return 0.95
 
 alphas = np.array([adaptive_alpha(br) for br in base_rates])
-blend  = lr_ens * alphas + base_rates * (1.0 - alphas)
+blend  = combined_ens * alphas + base_rates * (1.0 - alphas)
 blend  = np.clip(blend, 1e-6, 1.0 - 1e-6)
 
 # ============================================================
