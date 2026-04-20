@@ -1,237 +1,304 @@
 """
-MoA Prediction: Transductive PCA + Nystroem kernel features + LogReg ensemble
+MoA Prediction: Nystroem features + pure-NumPy vectorized ensemble + OOF weights
 
-Strategy: MLPClassifier multiprocessing doesn't parallelize on this node (1075s).
-LogisticRegression LBFGS via MultiOutputClassifier(n_jobs=-1) IS fast (~15s each).
-Maximise richness of features + diversity of LogReg ensemble + adaptive calibration.
-
-Feature caching: features saved to disk on first run, loaded instantly on subsequent runs.
-This gives ~60s extra budget for more models under heavy load.
-
-Features:
-  - Transductive PCA: gene (50 comps), cell (30 comps) — fit on train+test combined
-  - Top-50 raw high-variance gene features alongside PCA
-  - cp_time/cp_dose interactions with top gene PCs
-  - Cross-PCA (gene × cell) interactions
-  - Nystroem RBF kernel features (~300) on 50-dim PCA subspace
+Key design choices:
+  - Load from features_cache_v2.npz (472-dim: Nystroem RBF + PCA + interactions)
+  - Pure-NumPy full-batch vec_logreg (Adam): avoids sklearn loky/multiprocess overhead
+  - Pure-NumPy full-batch vec_2layer (Adam): 10x faster than sklearn MLPClassifier
+  - OOF weight optimization: scipy L-BFGS-B on 15% holdout minimizes log loss directly
+  - OMP_NUM_THREADS=4 for single-process BLAS (no loky workers → no oversubscription)
+  - Warm bias init: logit(base_rate) for fast convergence on 99.7%-sparse targets
 """
-import pandas as pd
-import numpy as np
-import time
 import os
+os.environ['OMP_NUM_THREADS'] = '4'
+os.environ['OPENBLAS_NUM_THREADS'] = '4'
+os.environ['MKL_NUM_THREADS'] = '4'
+
+import sys
+sys.stdout.reconfigure(line_buffering=True)
+
+import numpy as np
+import pandas as pd
+import time
 import warnings
 warnings.filterwarnings('ignore')
 
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
-from sklearn.kernel_approximation import Nystroem
-from sklearn.multioutput import MultiOutputClassifier
-
 t_start = time.time()
 
-# Cache version — increment when feature engineering changes
-CACHE_VERSION = "v2"
-CACHE_FILE = f"features_cache_{CACHE_VERSION}.npz"
+# ============================================================
+# Load features from cache
+# ============================================================
+CACHE_FILE = "features_cache_v2.npz"
+
+print(f"Loading cached features...")
+cache = np.load(CACHE_FILE)
+X_train = cache['X_train'].astype(np.float32)
+X_test  = cache['X_test'].astype(np.float32)
+y_active = cache['y_active'].astype(np.float32)
+active_idx = cache['active_idx']
+base_rates = cache['base_rates'].astype(np.float32)
+test_trt_positions = cache['test_trt_positions'].tolist()
+n_targets = int(cache['n_targets'])
+print(f"Cache loaded: {time.time() - t_start:.1f}s  {X_train.shape=}")
+
+# Load submission metadata
+test_features = pd.read_csv("data/test_features.csv")
+target_cols = [c for c in pd.read_csv("data/train_targets.csv", nrows=0).columns if c != "sig_id"]
+n_targets = len(target_cols)
+n_active = y_active.shape[1]
 
 # ============================================================
-# Load from cache or compute features
+# OOF split for blend weight optimization
 # ============================================================
-if os.path.exists(CACHE_FILE):
-    print(f"Loading cached features...")
-    cache = np.load(CACHE_FILE)
-    X_train = cache['X_train']
-    X_test  = cache['X_test']
-    y_active = cache['y_active']
-    active_idx = cache['active_idx']
-    base_rates = cache['base_rates']
-    test_trt_positions = cache['test_trt_positions'].tolist()
-    n_targets = int(cache['n_targets'])
-    print(f"Cache loaded: {time.time() - t_start:.1f}s  {X_train.shape=}")
+VAL_FRAC = 0.12
+np.random.seed(42)
+perm = np.random.permutation(len(X_train))
+n_val = int(len(X_train) * VAL_FRAC)
+val_idx = perm[:n_val]
+tr_idx  = perm[n_val:]
 
-else:
-    print("Computing features (will be cached for future runs)...")
-
-    # Load data
-    train_features = pd.read_csv("data/train_features.csv")
-    train_targets   = pd.read_csv("data/train_targets.csv")
-    test_features   = pd.read_csv("data/test_features.csv")
-
-    target_cols = [c for c in train_targets.columns if c != "sig_id"]
-    gene_cols   = [c for c in train_features.columns if c.startswith('g-')]
-    cell_cols   = [c for c in train_features.columns if c.startswith('c-')]
-    n_targets   = len(target_cols)
-
-    # Separate controls
-    train_ctrl_mask = train_features['cp_type'] == 'ctl_vehicle'
-    test_ctrl_mask  = test_features['cp_type']  == 'ctl_vehicle'
-    train_trt = train_features[~train_ctrl_mask].reset_index(drop=True)
-    test_trt  = test_features[~test_ctrl_mask].copy()
-    test_trt_positions = test_features[~test_ctrl_mask].index.tolist()
-
-    y_train = (
-        train_targets.set_index('sig_id')
-        .loc[train_trt['sig_id'].tolist(), target_cols].values
-    )
-
-    # Encode cp_time / cp_dose
-    train_time = train_trt['cp_time'].map({24: 0.0, 48: 0.5, 72: 1.0}).values
-    train_dose = train_trt['cp_dose'].map({'D1': 0.0, 'D2': 1.0}).values
-    test_time  = test_trt['cp_time'].map({24: 0.0, 48: 0.5, 72: 1.0}).values
-    test_dose  = test_trt['cp_dose'].map({'D1': 0.0, 'D2': 1.0}).values
-
-    # Transductive PCA
-    def trans_pca(train_arr, test_arr, n_components):
-        all_data = np.vstack([train_arr, test_arr])
-        pca = PCA(n_components=n_components, svd_solver='randomized', random_state=42)
-        pca.fit(all_data)
-        return pca.transform(train_arr), pca.transform(test_arr)
-
-    gene_tr, gene_te = trans_pca(
-        train_trt[gene_cols].values, test_trt[gene_cols].values, n_components=50)
-    cell_tr, cell_te = trans_pca(
-        train_trt[cell_cols].values, test_trt[cell_cols].values, n_components=30)
-    print(f"Transductive PCA done: {time.time() - t_start:.1f}s")
-
-    # Top-50 raw high-variance gene features
-    gene_var = train_trt[gene_cols].var().values
-    top50_idx = np.argsort(gene_var)[-50:]
-    raw_gene_tr = train_trt[gene_cols].values[:, top50_idx]
-    raw_gene_te = test_trt[gene_cols].values[:, top50_idx]
-
-    # Interaction features
-    N_INTERACT = 15
-    t_tr = train_time.reshape(-1, 1)
-    d_tr = train_dose.reshape(-1, 1)
-    t_te = test_time.reshape(-1, 1)
-    d_te = test_dose.reshape(-1, 1)
-    interact_tr = np.hstack([
-        gene_tr[:, :N_INTERACT] * t_tr,
-        gene_tr[:, :N_INTERACT] * d_tr,
-        gene_tr[:, :10] * cell_tr[:, :10],
-    ])
-    interact_te = np.hstack([
-        gene_te[:, :N_INTERACT] * t_te,
-        gene_te[:, :N_INTERACT] * d_te,
-        gene_te[:, :10] * cell_te[:, :10],
-    ])
-    cp_tr = np.column_stack([train_time, train_dose])
-    cp_te = np.column_stack([test_time, test_dose])
-
-    # Base features (172 dims)
-    X_base_tr = np.hstack([gene_tr, cell_tr, raw_gene_tr, interact_tr, cp_tr])
-    X_base_te = np.hstack([gene_te, cell_te, raw_gene_te, interact_te, cp_te])
-    scaler = StandardScaler()
-    X_base_tr = scaler.fit_transform(X_base_tr)
-    X_base_te = scaler.transform(X_base_te)
-
-    # Nystroem RBF on 50-dim PCA subspace
-    X_low_tr = np.hstack([gene_tr[:, :35], cell_tr[:, :15]])
-    X_low_te = np.hstack([gene_te[:, :35], cell_te[:, :15]])
-    low_scaler = StandardScaler()
-    X_low_tr = low_scaler.fit_transform(X_low_tr)
-    X_low_te = low_scaler.transform(X_low_te)
-    nys = Nystroem(kernel='rbf', n_components=300, gamma=0.03, random_state=42)
-    nys.fit(X_low_tr)
-    X_nys_tr = nys.transform(X_low_tr)
-    X_nys_te = nys.transform(X_low_te)
-
-    X_train = np.hstack([X_base_tr, X_nys_tr])   # 472 dims
-    X_test  = np.hstack([X_base_te, X_nys_te])
-    print(f"Full feature matrix: {X_train.shape}")
-
-    # Target bookkeeping
-    active_mask = y_train.sum(axis=0) > 0
-    active_idx  = np.where(active_mask)[0]
-    y_active    = y_train[:, active_idx]
-    base_rates  = y_active.mean(axis=0)
-
-    print(f"Feature engineering done: {time.time() - t_start:.1f}s")
-
-    # Save cache for subsequent runs
-    np.savez(CACHE_FILE,
-             X_train=X_train, X_test=X_test, y_active=y_active,
-             active_idx=active_idx, base_rates=base_rates,
-             test_trt_positions=np.array(test_trt_positions),
-             n_targets=np.array(n_targets))
-    print(f"Features cached to {CACHE_FILE}")
-
-# Load submission metadata if coming from cache
-if 'test_features' not in dir():
-    test_features = pd.read_csv("data/test_features.csv")
-    target_cols = [c for c in pd.read_csv("data/train_targets.csv", nrows=0).columns if c != "sig_id"]
-    n_targets = len(target_cols)
+X_tr  = X_train[tr_idx]
+X_val = X_train[val_idx]
+y_tr  = y_active[tr_idx]
+y_val = y_active[val_idx]
+print(f"OOF split: {len(X_tr)} train / {len(X_val)} val  t={time.time()-t_start:.1f}s")
 
 # ============================================================
-# LogReg ensemble — LBFGS parallelizes across targets via n_jobs=-1
+# Vectorized multi-output LogReg with Adam (warm bias init)
 # ============================================================
-def get_proba(mo_clf, X):
-    out = np.zeros((X.shape[0], len(mo_clf.estimators_)))
-    for i, est in enumerate(mo_clf.estimators_):
-        if not hasattr(est, 'classes_') or len(est.classes_) == 1:
-            out[:, i] = float(est.classes_[0]) if hasattr(est, 'classes_') else 0.0
-        else:
-            pos = np.where(est.classes_ == 1)[0][0]
-            out[:, i] = est.predict_proba(X)[:, pos]
+def vec_logreg(X, y, C=0.1, n_iter=80, lr=0.01):
+    """Full-batch Adam logistic regression, all targets simultaneously."""
+    n, p = X.shape; m = y.shape[1]
+    Xb = np.hstack([X, np.ones((n, 1), dtype=np.float32)])
+    base = y.mean(0).clip(1e-4, 1 - 1e-4).astype(np.float32)
+    W = np.zeros((p + 1, m), dtype=np.float32)
+    W[-1] = np.log(base / (1.0 - base))  # warm bias
+    XtY = (Xb.T @ y).astype(np.float32)
+    reg = np.float32(1.0 / (C * n))
+    b1, b2, eps = np.float32(0.9), np.float32(0.999), np.float32(1e-8)
+    mW, vW = np.zeros_like(W), np.zeros_like(W)
+    for it in range(1, n_iter + 1):
+        pred = 1.0 / (1.0 + np.exp(-np.clip(Xb @ W, -50, 50)))
+        g = (Xb.T @ pred - XtY) / n
+        g[:-1] += reg * W[:-1]
+        mW = b1 * mW + (1 - b1) * g
+        vW = b2 * vW + (1 - b2) * (g * g)
+        W -= lr * (mW / (1 - b1 ** it)) / (np.sqrt(vW / (1 - b2 ** it)) + eps)
+    def predict(Xnew):
+        Xb2 = np.hstack([Xnew, np.ones((len(Xnew), 1), dtype=np.float32)])
+        return 1.0 / (1.0 + np.exp(-np.clip(Xb2 @ W, -50, 50)))
+    return predict
+
+# ============================================================
+# Vectorized 2-layer MLP with Adam (warm bias init)
+# ============================================================
+def vec_2layer(X, y, C=0.1, hidden=64, n_iter=80, lr=0.005, seed=0):
+    """Full-batch 2-layer MLP. X → hidden → ReLU → 205 sigmoid outputs.
+    Warm bias = logit(base_rate) for fast convergence on sparse targets."""
+    n, p = X.shape; m = y.shape[1]
+    rng = np.random.default_rng(seed)
+    W1 = (rng.standard_normal((p, hidden)) * np.sqrt(2.0 / p)).astype(np.float32)
+    b1 = np.zeros(hidden, dtype=np.float32)
+    W2 = (rng.standard_normal((hidden, m)) * np.sqrt(2.0 / hidden)).astype(np.float32)
+    base = y.mean(0).clip(1e-4, 1 - 1e-4).astype(np.float32)
+    b2 = np.log(base / (1.0 - base))
+    reg = np.float32(1.0 / (C * n))
+    a1, a2, eps = np.float32(0.9), np.float32(0.999), np.float32(1e-8)
+    mW1, vW1 = np.zeros_like(W1), np.zeros_like(W1)
+    mb1, vb1 = np.zeros_like(b1), np.zeros_like(b1)
+    mW2, vW2 = np.zeros_like(W2), np.zeros_like(W2)
+    mb2, vb2 = np.zeros_like(b2), np.zeros_like(b2)
+    for it in range(1, n_iter + 1):
+        bc, bv = 1.0 - a1 ** it, 1.0 - a2 ** it
+        h    = np.maximum(0.0, X @ W1 + b1)
+        pred = 1.0 / (1.0 + np.exp(-np.clip(h @ W2 + b2, -50, 50)))
+        err  = (pred - y) / n
+        gW2 = h.T @ err;   gW2 += reg * W2
+        gb2 = err.sum(0)
+        dh  = (err @ W2.T) * (h > 0)
+        gW1 = X.T @ dh;    gW1 += reg * W1
+        gb1 = dh.sum(0)
+        for param, g, mP, vP in [(W2, gW2, mW2, vW2), (b2, gb2, mb2, vb2),
+                                   (W1, gW1, mW1, vW1), (b1, gb1, mb1, vb1)]:
+            mP[:] = a1 * mP + (1 - a1) * g
+            vP[:] = a2 * vP + (1 - a2) * (g * g)
+            param -= lr * (mP / bc) / (np.sqrt(vP / bv) + eps)
+    def predict(Xnew):
+        h = np.maximum(0.0, Xnew @ W1 + b1)
+        return 1.0 / (1.0 + np.exp(-np.clip(h @ W2 + b2, -50, 50)))
+    return predict
+
+# ============================================================
+# Helpers: full-target predictions + submission
+# ============================================================
+def full_pred(p_active):
+    """Expand n_active predictions to n_targets."""
+    out = np.full((len(p_active), n_targets), 0.001, dtype=np.float32)
+    out[:, active_idx] = np.clip(p_active, 0, 1)
     return out
 
-# Time-aware ensemble: use as many C values as time allows
-TIME_LIMIT = 285  # leave 15s buffer for submission writing
-C_VALUES = [0.03, 0.05, 0.07, 0.10, 0.13]  # 5 low-C models — sparse data needs high regularization
 
-lr_preds = []
-for C in C_VALUES:
-    elapsed = time.time() - t_start
-    # Estimate time needed for remaining models: at least 15s per remaining model
-    models_remaining = len(C_VALUES) - len(lr_preds) - 1
-    min_time_needed = 15  # minimum seconds to complete one more model
-    if elapsed > TIME_LIMIT - min_time_needed:
-        print(f"  Stopping at {len(lr_preds)} models (elapsed={elapsed:.0f}s)")
-        break
-
-    t0 = time.time()
-    mo = MultiOutputClassifier(
-        LogisticRegression(C=C, solver='lbfgs', max_iter=300),
-        n_jobs=-1,
-    )
-    mo.fit(X_train, y_active)
-    lr_preds.append(get_proba(mo, X_test))
-    print(f"  LogReg C={C}: {time.time()-t0:.1f}s")
-
-if not lr_preds:
-    # Fallback: use base rate predictions if no models completed
-    print("WARNING: No models completed, using base rates")
-    lr_ens = np.tile(base_rates, (X_test.shape[0], 1))
-else:
-    lr_ens = np.mean(lr_preds, axis=0)
-
-print(f"LogReg ensemble done ({len(lr_preds)} models): {time.time() - t_start:.1f}s")
-
-# ============================================================
-# Adaptive Bayesian calibration
-# ============================================================
 def adaptive_alpha(br):
-    if   br < 0.001: return 0.83
-    elif br < 0.003: return 0.88
-    elif br < 0.007: return 0.92
-    elif br < 0.015: return 0.95
-    else:            return 0.97
+    if   br < 0.001: return 0.10
+    elif br < 0.003: return 0.07
+    elif br < 0.007: return 0.05
+    elif br < 0.020: return 0.03
+    else:            return 0.01
 
-alphas = np.array([adaptive_alpha(br) for br in base_rates])
-blend  = lr_ens * alphas + base_rates * (1.0 - alphas)
-blend  = np.clip(blend, 1e-6, 1.0 - 1e-6)
+
+alphas = np.array([adaptive_alpha(br) for br in base_rates], dtype=np.float32)
+
+
+def save_submission(ensemble_active):
+    """Calibrate + write submission.csv."""
+    ens = np.clip(ensemble_active, 1e-6, 1 - 1e-6).astype(np.float32)
+    # Bayesian shrinkage toward base rate
+    ens = (1.0 - alphas) * ens + alphas * base_rates
+    ens = np.clip(ens, 1e-6, 1 - 1e-6)
+
+    preds_full = np.full((len(test_features), n_targets), 0.001, dtype=np.float32)
+    for i, orig_pos in enumerate(test_trt_positions):
+        row = np.full(n_targets, 0.001, dtype=np.float32)
+        row[active_idx] = ens[i]
+        preds_full[orig_pos] = row
+    sub = pd.DataFrame(preds_full, columns=target_cols)
+    sub.insert(0, "sig_id", test_features["sig_id"].values)
+    sub.to_csv("submission.csv", index=False)
+
 
 # ============================================================
-# Assemble submission
+# Training: fill budget with LogReg then 2-layer MLP
+# BUDGET: 260s for models, 30s for OOF opt + I/O
 # ============================================================
-preds_full = np.full((len(test_features), n_targets), 0.001)
-for i, orig_pos in enumerate(test_trt_positions):
-    row = np.full(n_targets, 0.001)
-    row[active_idx] = blend[i]
-    preds_full[orig_pos] = row
+BUDGET = 260.0
 
-submission = pd.DataFrame(preds_full, columns=target_cols)
-submission.insert(0, "sig_id", test_features["sig_id"].values)
-submission.to_csv("submission.csv", index=False)
-print(f"Submission saved: {len(submission)} rows x {n_targets} targets")
+all_test  = []   # test set predictions per model
+all_val   = []   # val set predictions per model
+
+
+def time_left():
+    return BUDGET - (time.time() - t_start)
+
+
+def add_model(fn):
+    all_test.append(full_pred(fn(X_test)))
+    all_val.append(full_pred(fn(X_val)))
+
+
+# --- LogReg at multiple C values ---
+print("LogReg ensemble...")
+for C in [0.03, 0.05, 0.07, 0.10, 0.13, 0.18, 0.25]:
+    if time_left() < 8:
+        print(f"  Budget exhausted at {len(all_test)} LogReg models")
+        break
+    t0 = time.time()
+    fn = vec_logreg(X_tr, y_tr, C=C, n_iter=80, lr=0.01)
+    add_model(fn)
+    print(f"  LR C={C}: {time.time()-t0:.1f}s  total={time.time()-t_start:.1f}s")
+
+# --- Modality LogReg: gene-only (0:50) and cell-only (50:80) PCA components ---
+print("Modality LogReg...")
+# Gene PCA is cols 0:50, cell PCA is cols 50:80 in the cached feature matrix
+for slc, label in [(slice(0, 50), "gene"), (slice(50, 80), "cell")]:
+    X_mod_tr  = X_tr[:, slc]
+    X_mod_val = X_val[:, slc]
+    X_mod_te  = X_test[:, slc]
+    for C in [0.1, 0.3]:
+        if time_left() < 8:
+            print(f"  Budget exhausted, skipping {label} C={C}")
+            break
+        t0 = time.time()
+        fn = vec_logreg(X_mod_tr, y_tr, C=C, n_iter=80, lr=0.01)
+        all_test.append(full_pred(fn(X_mod_te)))
+        all_val.append(full_pred(fn(X_mod_val)))
+        print(f"  {label} C={C}: {time.time()-t0:.1f}s  total={time.time()-t_start:.1f}s")
+
+# --- 2-layer MLP ensemble at multiple configs ---
+print("2-layer MLP ensemble...")
+mlp_configs = [
+    # (seed, hidden, n_iter, lr, C)
+    (0,   64,  80, 0.005, 0.10),
+    (1,   64,  80, 0.005, 0.10),
+    (2,   64,  80, 0.005, 0.10),
+    (3,   64,  80, 0.005, 0.10),
+    (4,   64,  80, 0.005, 0.10),
+    (5,   64,  80, 0.005, 0.10),
+    (0,   64,  80, 0.005, 0.20),
+    (1,   64,  80, 0.005, 0.20),
+    (2,   64,  80, 0.005, 0.20),
+    (0,  128,  60, 0.003, 0.10),
+    (1,  128,  60, 0.003, 0.10),
+    (2,  128,  60, 0.003, 0.10),
+    (3,  128,  60, 0.003, 0.10),
+    (0,  128,  60, 0.003, 0.20),
+    (1,  128,  60, 0.003, 0.20),
+    (0,   64, 100, 0.003, 0.10),
+    (1,   64, 100, 0.003, 0.10),
+    (2,   64, 100, 0.003, 0.10),
+    (0,  128,  80, 0.003, 0.10),
+    (1,  128,  80, 0.003, 0.10),
+    (0,  256,  40, 0.002, 0.10),
+    (1,  256,  40, 0.002, 0.10),
+    (2,  256,  40, 0.002, 0.10),
+]
+for seed, hidden, n_iter, lr, C in mlp_configs:
+    remaining = time_left()
+    if remaining < 20:
+        print(f"  Stopping MLP at {len(all_test)} models, {remaining:.0f}s remain")
+        break
+    if hidden >= 256 and remaining < 30:
+        continue
+    if hidden >= 128 and remaining < 25:
+        continue
+    t0 = time.time()
+    fn = vec_2layer(X_tr, y_tr, C=C, hidden=hidden, n_iter=n_iter, lr=lr, seed=seed)
+    add_model(fn)
+    dt = time.time() - t0
+    print(f"  MLP h={hidden} s={seed} C={C}: {dt:.1f}s  total={time.time()-t_start:.1f}s")
+
+# ============================================================
+# OOF weight optimization with scipy L-BFGS-B
+# ============================================================
+print(f"\nOOF weight optimization ({len(all_test)} models, {time_left():.0f}s remain)...")
+from scipy.optimize import minimize as scipy_minimize
+
+val_stack  = np.array(all_val,  dtype=np.float64)   # (n_models, n_val, n_targets)
+test_stack = np.array(all_test, dtype=np.float64)
+n_m = len(all_test)
+
+# Build full val targets
+y_val_full = np.zeros((len(X_val), n_targets), dtype=np.float64)
+y_val_full[:, active_idx] = y_val.astype(np.float64)
+
+
+def oof_loss(log_w):
+    w = np.exp(log_w - log_w.max())
+    w /= w.sum()
+    blend = np.einsum('m,mjt->jt', w, val_stack)
+    blend = np.clip(blend, 1e-7, 1 - 1e-7)
+    ll = -(y_val_full * np.log(blend) + (1 - y_val_full) * np.log(1 - blend))
+    return ll.mean()
+
+
+t_opt = time.time()
+res = scipy_minimize(oof_loss, np.zeros(n_m), method='L-BFGS-B',
+                     options={'maxiter': 500, 'ftol': 1e-9})
+opt_w = np.exp(res.x - res.x.max()); opt_w /= opt_w.sum()
+print(f"  OOF val loss: {res.fun:.6f}  ({time.time()-t_opt:.1f}s)")
+print(f"  Top weights: {sorted(opt_w, reverse=True)[:5]}")
+
+# ============================================================
+# Weighted ensemble + calibration + submission
+# ============================================================
+print(f"Ensembling {n_m} models...")
+w = opt_w.astype(np.float32)
+ensemble_full = np.einsum('m,mjt->jt', w.astype(np.float64),
+                           test_stack).astype(np.float32)
+
+# Extract active predictions for calibration
+ens_active = ensemble_full[:, active_idx]
+save_submission(ens_active)
+
+print(f"\nFinal ensemble: {n_m} models")
 print(f"Total time: {time.time() - t_start:.1f}s")
+print(f"Submission: {len(test_features)} rows x {n_targets} targets")
